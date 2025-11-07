@@ -2,133 +2,164 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
-const os = require('os');
 
-function validateParams(params) {
+const args = {};
+for (let i = 2; i < process.argv.length; i++) {
+  if (process.argv[i].startsWith('--')) {
+    const key = process.argv[i].slice(2);
+    const next = process.argv[i + 1];
+    if (next && !next.startsWith('--')) {
+      args[key] = next;
+      i++;
+    } else {
+      args[key] = true;
+    }
+  }
+}
+
+function validateArgs(args) {
   const errors = [];
 
-  if (!params['package-name'] || typeof params['package-name'] !== 'string' || !params['package-name'].trim()) {
-    errors.push('--package-name обязателен и не может быть пустым.');
+  if (!args['package-name']) errors.push('--package-name обязателен');
+  if (!args['repo']) errors.push('--repo обязателен');
+  if (!args['repo-mode'] || !['clone', 'use-local'].includes(args['repo-mode'])) {
+    errors.push('--repo-mode должен быть "clone" или "use-local"');
   }
 
-  if (!params['repo'] || typeof params['repo'] !== 'string') {
-    errors.push('--repo обязателен.');
+  const maxDepth = args['max-depth'] !== undefined ? Number(args['max-depth']) : 3;
+  if (isNaN(maxDepth) || maxDepth < 0 || !Number.isInteger(maxDepth)) {
+    errors.push('--max-depth должен быть неотрицательным целым числом');
   }
 
-  const validModes = ['clone', 'use-local', 'download'];
-  if (!params['repo-mode'] || !validModes.includes(params['repo-mode'])) {
-    errors.push(`--repo-mode должен быть одним из: ${validModes.join(', ')}`);
-  }
-
-  if (errors.length > 0) throw new Error(errors.join('\n'));
-
+  if (errors.length) throw new Error(errors.join('\n'));
   return {
-    packageName: params['package-name'].trim(),
-    repo: params['repo'].trim(),
-    mode: params['repo-mode']
+    packageName: args['package-name'],
+    repo: args['repo'],
+    mode: args['repo-mode'],
+    maxDepth: maxDepth,
+    filter: args['filter'] || ''
   };
 }
 
-function isGitInstalled() {
-  try {
-    execSync('git --version', { stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
-  }
+function parseTestGraph(filePath) {
+  const content = fs.readFileSync(filePath, 'utf8');
+  const graph = {};
+  content.split('\n').forEach(line => {
+    line = line.trim();
+    if (!line || line.startsWith('#')) return;
+    const [pkg, depsStr] = line.split(':').map(s => s.trim());
+    if (pkg) {
+      const deps = depsStr ? depsStr.split(/\s+/).filter(d => d) : [];
+      graph[pkg] = deps;
+    }
+  });
+  return graph;
 }
 
-function extractDependencies(packageJsonPath) {
-  if (!fs.existsSync(packageJsonPath)) {
-    console.warn(` Файл package.json не найден по пути: ${packageJsonPath}`);
-    return [];
+function buildDependencyGraph(root, graph, maxDepth, filter) {
+  if (!graph[root]) {
+    console.log(` Пакет "${root}" не найден в графе.`);
+    return { tree: [], hasCycle: false };
+  }
+  const visited = new Set();
+  const depthMap = new Map();
+  const queue = [{ pkg: root, depth: 0, path: [root] }];
+  const resultTree = [];
+  let hasCycle = false;
+
+  while (queue.length > 0) {
+    const { pkg, depth, path } = queue.shift();
+
+    if (depth > maxDepth) continue;
+    if (filter && pkg.includes(filter)) continue;
+
+    if (!visited.has(pkg)) {
+      visited.add(pkg);
+      depthMap.set(pkg, depth);
+      resultTree.push({ pkg, depth, deps: [] });
+    }
+
+    const currentDeps = graph[pkg] || [];
+    for (const dep of currentDeps) {
+      if (filter && dep.includes(filter)) continue;
+      if (depth + 1 > maxDepth) continue;
+
+      const newPath = [...path, dep];
+      if (path.includes(dep)) {
+        hasCycle = true;
+        console.warn(` Обнаружен цикл: ${newPath.join(' → ')}`);
+        continue;
+      }
+      queue.push({ pkg: dep, depth: depth + 1, path: newPath });
+      const parent = resultTree.find(n => n.pkg === pkg);
+      if (parent && !parent.deps.includes(dep)) {
+        parent.deps.push(dep);
+      }
+    }
   }
 
-  try {
-    const content = fs.readFileSync(packageJsonPath, 'utf8');
-    const pkg = JSON.parse(content);
-    const deps = pkg.dependencies || {};
-    return Object.keys(deps).map(name => ({
-      name,
-      version: deps[name]
-    }));
-  } catch (e) {
-    console.error(' Ошибка при чтении или парсинге package.json:', e.message);
-    return [];
+  return { tree: resultTree, hasCycle };
+}
+
+function printTree(tree, root) {
+  const nodeMap = new Map(tree.map(n => [n.pkg, n]));
+  console.log(`\n Граф зависимостей для "${root}":`);
+
+  function printNode(pkg, prefix = '') {
+    console.log(`${prefix}├── ${pkg}`);
+    const node = nodeMap.get(pkg);
+    if (node && node.deps.length > 0) {
+      node.deps.forEach((dep, i) => {
+        const isLast = i === node.deps.length - 1;
+        printNode(dep, prefix + (isLast ? '    ' : '│   '));
+      });
+    }
+  }
+
+  if (tree.length > 0) {
+    console.log(root);
+    const rootNode = nodeMap.get(root);
+    if (rootNode) {
+      rootNode.deps.forEach((dep, i) => {
+        const isLast = i === rootNode.deps.length - 1;
+        printNode(dep, isLast ? '    ' : '│   ');
+      });
+    }
+  } else {
+    console.log(' (Нет зависимостей в пределах глубины и фильтра)');
   }
 }
 
 function main() {
-  const args = {};
-  const a = 0;
-  for (let i = 2; i < process.argv.length; i++) {
-    if (process.argv[i].startsWith('--')) {
-      const key = process.argv[i].slice(2);
-      const next = process.argv[i + 1];
-      if (next && !next.startsWith('--')) {
-        args[key] = next;
-        i++;
-      } else {
-        args[key] = true;
-      }
-    }
-  }
-
   try {
-    const config = validateParams(args);
+    const config = validateArgs(args);
+    console.log('Запуск анализа зависимостей...');
+    console.log('Параметры:', config);
 
-    console.log('Конфигурация:');
-    console.log('  Имя пакета:', config.packageName);
-    console.log('  Репозиторий:', config.repo);
-    console.log('  Режим:', config.mode);
-    console.log('');
-
-    if (!isGitInstalled()) {
-      console.error(' Git не установлен. Установите Git для работы с репозиториями.');
-      process.exit(1);
+    if (config.mode === 'use-local') {
+      if (!fs.existsSync(config.repo)) {
+        throw new Error(`Файл не найден: ${config.repo}`);
+      }
+      const graph = parseTestGraph(config.repo);
+      console.log('\n Загружен тестовый граф:');
+      Object.entries(graph).forEach(([pkg, deps]) => {
+        console.log(`  ${pkg}: [${deps.join(', ')}]`);
+      });
+      const { tree, hasCycle } = buildDependencyGraph(
+        config.packageName,
+        graph,
+        config.maxDepth,
+        config.filter
+      );
+      printTree(tree, config.packageName);
+      if (hasCycle) {
+        console.log('\n Обнаружены циклические зависимости.');
+      }
+    } else {
+      console.log('Режим "clone" временно не поддерживается (репозиторий пуст).');
     }
-
-    // Создаём временную папку
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deps-analyzer-'));
-    console.log(` Временная папка: ${tempDir}`);
-
-    try {
-      if (config.mode === 'clone') {
-        console.log(' Клонирование репозитория...');
-        execSync(`git clone "${config.repo}" .`, {
-          cwd: tempDir,
-          stdio: 'inherit'
-        });
-      } else {
-        console.error(' Поддерживается только режим "clone" на этом этапе.');
-        process.exit(1);
-      }
-
-      const packageJsonPath = path.join(tempDir, 'package.json');
-      const deps = extractDependencies(packageJsonPath);
-
-      console.log('\n Прямые зависимости пакета:');
-      if (deps.length === 0) {
-        console.log('  (Нет зависимостей или package.json отсутствует)');
-      } else {
-        deps.forEach(dep => {
-          console.log(`  - ${dep.name}@${dep.version}`);
-        });
-      }
-
-    } finally {
-      // Удаляем временную папку
-      try {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-        console.log('\n Временная папка удалена.');
-      } catch (e) {
-        console.warn('  Не удалось удалить временную папку:', tempDir);
-      }
-    }
-
   } catch (err) {
-    console.error('Ошибка:', err.message);
+    console.error(' Ошибка:', err.message);
     process.exit(1);
   }
 }
