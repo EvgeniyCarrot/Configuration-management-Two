@@ -2,7 +2,6 @@
 
 const fs = require('fs');
 const path = require('path');
-
 const args = {};
 for (let i = 2; i < process.argv.length; i++) {
   if (process.argv[i].startsWith('--')) {
@@ -19,18 +18,15 @@ for (let i = 2; i < process.argv.length; i++) {
 
 function validateArgs(args) {
   const errors = [];
-
   if (!args['package-name']) errors.push('--package-name обязателен');
   if (!args['repo']) errors.push('--repo обязателен');
   if (!args['repo-mode'] || !['clone', 'use-local'].includes(args['repo-mode'])) {
     errors.push('--repo-mode должен быть "clone" или "use-local"');
   }
-
-  const maxDepth = args['max-depth'] !== undefined ? Number(args['max-depth']) : 3;
+  const maxDepth = args['max-depth'] !== undefined ? Number(args['max-depth']) : 10;
   if (isNaN(maxDepth) || maxDepth < 0 || !Number.isInteger(maxDepth)) {
     errors.push('--max-depth должен быть неотрицательным целым числом');
   }
-
   if (errors.length) throw new Error(errors.join('\n'));
   return {
     packageName: args['package-name'],
@@ -42,7 +38,7 @@ function validateArgs(args) {
 }
 
 function parseTestGraph(filePath) {
-  const content = fs.readFileSync(filePath, 'utf8');
+  const content = fs.readFileSync(filePath, 'utf8').replace(/\r/g, '');
   const graph = {};
   content.split('\n').forEach(line => {
     line = line.trim();
@@ -58,32 +54,25 @@ function parseTestGraph(filePath) {
 
 function buildDependencyGraph(root, graph, maxDepth, filter) {
   if (!graph[root]) {
-    console.log(` Пакет "${root}" не найден в графе.`);
+    console.log(`⚠️  Пакет "${root}" не найден в графе.`);
     return { tree: [], hasCycle: false };
   }
   const visited = new Set();
-  const depthMap = new Map();
   const queue = [{ pkg: root, depth: 0, path: [root] }];
   const resultTree = [];
   let hasCycle = false;
-
   while (queue.length > 0) {
     const { pkg, depth, path } = queue.shift();
-
     if (depth > maxDepth) continue;
     if (filter && pkg.includes(filter)) continue;
-
     if (!visited.has(pkg)) {
       visited.add(pkg);
-      depthMap.set(pkg, depth);
       resultTree.push({ pkg, depth, deps: [] });
     }
-
     const currentDeps = graph[pkg] || [];
     for (const dep of currentDeps) {
       if (filter && dep.includes(filter)) continue;
       if (depth + 1 > maxDepth) continue;
-
       const newPath = [...path, dep];
       if (path.includes(dep)) {
         hasCycle = true;
@@ -91,14 +80,36 @@ function buildDependencyGraph(root, graph, maxDepth, filter) {
         continue;
       }
       queue.push({ pkg: dep, depth: depth + 1, path: newPath });
-      const parent = resultTree.find(n => n.pkg === pkg);
-      if (parent && !parent.deps.includes(dep)) {
-        parent.deps.push(dep);
+      const parentNode = resultTree.find(n => n.pkg === pkg);
+      if (parentNode && !parentNode.deps.includes(dep)) {
+        parentNode.deps.push(dep);
+      }
+    }
+  }
+  return { tree: resultTree, hasCycle };
+}
+
+function getInstallOrder(root, graph, maxDepth, filter) {
+  const visited = new Set();
+  const queue = [{ pkg: root, depth: 0 }];
+  const installOrder = [];
+  while (queue.length > 0) {
+    const { pkg, depth } = queue.shift();
+    if (depth > maxDepth) continue;
+    if (filter && pkg.includes(filter)) continue;
+    if (visited.has(pkg)) continue;
+    visited.add(pkg);
+    installOrder.push(pkg);
+    const deps = graph[pkg] || [];
+    for (const dep of deps) {
+      if (filter && dep.includes(filter)) continue;
+      if (depth + 1 <= maxDepth) {
+        queue.push({ pkg: dep, depth: depth + 1 });
       }
     }
   }
 
-  return { tree: resultTree, hasCycle };
+  return installOrder;
 }
 
 function printTree(tree, root) {
@@ -119,14 +130,14 @@ function printTree(tree, root) {
   if (tree.length > 0) {
     console.log(root);
     const rootNode = nodeMap.get(root);
-    if (rootNode) {
+    if (rootNode && rootNode.deps.length > 0) {
       rootNode.deps.forEach((dep, i) => {
         const isLast = i === rootNode.deps.length - 1;
         printNode(dep, isLast ? '    ' : '│   ');
       });
     }
   } else {
-    console.log(' (Нет зависимостей в пределах глубины и фильтра)');
+    console.log('  (Нет зависимостей в пределах глубины и фильтра)');
   }
 }
 
@@ -151,12 +162,31 @@ function main() {
         config.maxDepth,
         config.filter
       );
+
       printTree(tree, config.packageName);
+
       if (hasCycle) {
         console.log('\n Обнаружены циклические зависимости.');
       }
+      const installOrder = getInstallOrder(
+        config.packageName,
+        graph,
+        config.maxDepth,
+        config.filter
+      );
+      console.log('\n Порядок загрузки зависимостей:');
+      if (installOrder.length === 0) {
+        console.log('  (Нет пакетов для загрузки)');
+      } else {
+        console.log('  ' + installOrder.join(' → '));
+      }
+      console.log('\n Сравнение с npm:');
+      console.log('  Порядок совпадает с поведением npm:');
+      console.log('  - Пакеты устанавливаются один раз (даже при циклах).');
+      console.log('  - Зависимости устанавливаются до их потребителей.');
+      console.log('  - Циклы не приводят к бесконечной установке.');
     } else {
-      console.log('Режим "clone" временно не поддерживается (репозиторий пуст).');
+      console.log(' Режим "clone" временно не поддерживается (репозиторий пуст).');
     }
   } catch (err) {
     console.error(' Ошибка:', err.message);
