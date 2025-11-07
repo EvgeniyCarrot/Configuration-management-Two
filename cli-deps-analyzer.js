@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+
 const args = {};
 for (let i = 2; i < process.argv.length; i++) {
   if (process.argv[i].startsWith('--')) {
@@ -27,13 +28,13 @@ function validateArgs(args) {
   if (isNaN(maxDepth) || maxDepth < 0 || !Number.isInteger(maxDepth)) {
     errors.push('--max-depth должен быть неотрицательным целым числом');
   }
-  if (errors.length) throw new Error(errors.join('\n'));
   return {
     packageName: args['package-name'],
     repo: args['repo'],
     mode: args['repo-mode'],
     maxDepth: maxDepth,
-    filter: args['filter'] || ''
+    filter: args['filter'] || '',
+    tree: args['tree'] === 'true' || args['tree'] === true
   };
 }
 
@@ -52,70 +53,61 @@ function parseTestGraph(filePath) {
   return graph;
 }
 
-function buildDependencyGraph(root, graph, maxDepth, filter) {
-  if (!graph[root]) {
-    console.log(`⚠️  Пакет "${root}" не найден в графе.`);
-    return { tree: [], hasCycle: false };
+function collectEdges(root, graph, maxDepth, filter) {
+  const visited = new Set();
+  const edges = new Set();
+  const queue = [{ pkg: root, depth: 0, path: [root] }];
+  while (queue.length > 0) {
+    const { pkg, depth, path } = queue.shift();
+    if (depth >= maxDepth) continue;
+    if (filter && pkg.includes(filter)) continue;
+    if (visited.has(pkg)) continue;
+    visited.add(pkg);
+    const deps = graph[pkg] || [];
+    for (const dep of deps) {
+      if (filter && dep.includes(filter)) continue;
+      const newPath = [...path, dep];
+      if (path.includes(dep)) continue; 
+      edges.add(`${pkg} -> ${dep}`);
+      queue.push({ pkg: dep, depth: depth + 1, path: newPath });
+    }
   }
+  return Array.from(edges);
+}
+
+function generateD2Graph(edges) {
+  if (edges.length === 0) return '// Граф пуст\n';
+  return edges.join('\n') + '\n';
+}
+
+function buildTree(root, graph, maxDepth, filter) {
   const visited = new Set();
   const queue = [{ pkg: root, depth: 0, path: [root] }];
-  const resultTree = [];
-  let hasCycle = false;
+  const nodeMap = new Map();
   while (queue.length > 0) {
     const { pkg, depth, path } = queue.shift();
     if (depth > maxDepth) continue;
     if (filter && pkg.includes(filter)) continue;
-    if (!visited.has(pkg)) {
-      visited.add(pkg);
-      resultTree.push({ pkg, depth, deps: [] });
-    }
-    const currentDeps = graph[pkg] || [];
-    for (const dep of currentDeps) {
-      if (filter && dep.includes(filter)) continue;
-      if (depth + 1 > maxDepth) continue;
-      const newPath = [...path, dep];
-      if (path.includes(dep)) {
-        hasCycle = true;
-        console.warn(` Обнаружен цикл: ${newPath.join(' → ')}`);
-        continue;
-      }
-      queue.push({ pkg: dep, depth: depth + 1, path: newPath });
-      const parentNode = resultTree.find(n => n.pkg === pkg);
-      if (parentNode && !parentNode.deps.includes(dep)) {
-        parentNode.deps.push(dep);
-      }
-    }
-  }
-  return { tree: resultTree, hasCycle };
-}
-
-function getInstallOrder(root, graph, maxDepth, filter) {
-  const visited = new Set();
-  const queue = [{ pkg: root, depth: 0 }];
-  const installOrder = [];
-  while (queue.length > 0) {
-    const { pkg, depth } = queue.shift();
-    if (depth > maxDepth) continue;
-    if (filter && pkg.includes(filter)) continue;
     if (visited.has(pkg)) continue;
     visited.add(pkg);
-    installOrder.push(pkg);
+    if (!nodeMap.has(pkg)) nodeMap.set(pkg, { pkg, deps: [] });
     const deps = graph[pkg] || [];
     for (const dep of deps) {
       if (filter && dep.includes(filter)) continue;
-      if (depth + 1 <= maxDepth) {
-        queue.push({ pkg: dep, depth: depth + 1 });
-      }
+      if (depth + 1 > maxDepth) continue;
+      const newPath = [...path, dep];
+      if (path.includes(dep)) continue;
+
+      nodeMap.get(pkg).deps.push(dep);
+      queue.push({ pkg: dep, depth: depth + 1, path: newPath });
     }
   }
-
-  return installOrder;
+  return { root, nodeMap };
 }
 
-function printTree(tree, root) {
-  const nodeMap = new Map(tree.map(n => [n.pkg, n]));
-  console.log(`\n Граф зависимостей для "${root}":`);
-
+function printTree(tree) {
+  const { root, nodeMap } = tree;
+  console.log(`\n ASCII-дерево для "${root}":`);
   function printNode(pkg, prefix = '') {
     console.log(`${prefix}├── ${pkg}`);
     const node = nodeMap.get(pkg);
@@ -126,25 +118,20 @@ function printTree(tree, root) {
       });
     }
   }
-
-  if (tree.length > 0) {
-    console.log(root);
-    const rootNode = nodeMap.get(root);
-    if (rootNode && rootNode.deps.length > 0) {
-      rootNode.deps.forEach((dep, i) => {
-        const isLast = i === rootNode.deps.length - 1;
-        printNode(dep, isLast ? '    ' : '│   ');
-      });
-    }
-  } else {
-    console.log('  (Нет зависимостей в пределах глубины и фильтра)');
+  console.log(root);
+  const rootNode = nodeMap.get(root);
+  if (rootNode) {
+    rootNode.deps.forEach((dep, i) => {
+      const isLast = i === rootNode.deps.length - 1;
+      printNode(dep, isLast ? '    ' : '│   ');
+    });
   }
 }
 
 function main() {
   try {
     const config = validateArgs(args);
-    console.log('Запуск анализа зависимостей...');
+    console.log('Генерация визуализации графа зависимостей...');
     console.log('Параметры:', config);
 
     if (config.mode === 'use-local') {
@@ -152,41 +139,20 @@ function main() {
         throw new Error(`Файл не найден: ${config.repo}`);
       }
       const graph = parseTestGraph(config.repo);
-      console.log('\n Загружен тестовый граф:');
-      Object.entries(graph).forEach(([pkg, deps]) => {
-        console.log(`  ${pkg}: [${deps.join(', ')}]`);
-      });
-      const { tree, hasCycle } = buildDependencyGraph(
-        config.packageName,
-        graph,
-        config.maxDepth,
-        config.filter
-      );
-
-      printTree(tree, config.packageName);
-
-      if (hasCycle) {
-        console.log('\n Обнаружены циклические зависимости.');
-      }
-      const installOrder = getInstallOrder(
-        config.packageName,
-        graph,
-        config.maxDepth,
-        config.filter
-      );
-      console.log('\n Порядок загрузки зависимостей:');
-      if (installOrder.length === 0) {
-        console.log('  (Нет пакетов для загрузки)');
-      } else {
-        console.log('  ' + installOrder.join(' → '));
+      const edges = collectEdges(config.packageName, graph, config.maxDepth, config.filter);
+      const d2Code = generateD2Graph(edges);
+      console.log('\n D2-диаграмма:');
+      console.log(d2Code);
+      if (config.tree) {
+        const tree = buildTree(config.packageName, graph, config.maxDepth, config.filter);
+        printTree(tree);
       }
       console.log('\n Сравнение с npm:');
-      console.log('  Порядок совпадает с поведением npm:');
-      console.log('  - Пакеты устанавливаются один раз (даже при циклах).');
-      console.log('  - Зависимости устанавливаются до их потребителей.');
-      console.log('  - Циклы не приводят к бесконечной установке.');
+      console.log('  - `npm ls` показывает дерево с версиями и может дублировать узлы при разных версиях.');
+      console.log('  -  D2-граф — упрощённый (только имена), без версий, без дубликатов.');
+      console.log('  - Циклы в npm разрешаются, но не отображаются явно; в D2 мы их опускаем.');
     } else {
-      console.log(' Режим "clone" временно не поддерживается (репозиторий пуст).');
+      console.log('  Режим "clone" не поддерживается (репозиторий пуст).');
     }
   } catch (err) {
     console.error(' Ошибка:', err.message);
